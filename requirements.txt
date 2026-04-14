@@ -1,0 +1,5 @@
+python-telegram-bot==21.10
+httpx
+apscheduler
+pytz
+python-dotenv

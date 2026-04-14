@@ -1,0 +1,730 @@
+import os
+import asyncio
+import logging
+import time
+from collections import defaultdict
+from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import httpx
+import pytz
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+SUPABASE_URL   = os.environ["SUPABASE_URL"]
+SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
+ADMIN_ID       = "539648155"
+CONTACT        = "@GPTttp"
+KZ_TZ          = pytz.timezone("Asia/Almaty")
+
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
+
+_last_msg: dict = defaultdict(float)
+
+def is_rate_limited(telegram_id: str) -> bool:
+    now = time.time()
+    if now - _last_msg[telegram_id] < 1.5:
+        return True
+    _last_msg[telegram_id] = now
+    return False
+
+MENU = ReplyKeyboardMarkup([
+    [KeyboardButton("🏠 Мои квартиры"), KeyboardButton("📊 Статус")],
+    [KeyboardButton("📅 Брони"), KeyboardButton("💰 Отчёт за месяц")],
+    [KeyboardButton("➕ Добавить квартиру"), KeyboardButton("🤖 Команды")],
+], resize_keyboard=True)
+
+ADMIN_MENU = ReplyKeyboardMarkup([
+    [KeyboardButton("🏠 Мои квартиры"), KeyboardButton("📊 Статус")],
+    [KeyboardButton("📅 Брони"), KeyboardButton("💰 Отчёт за месяц")],
+    [KeyboardButton("➕ Добавить квартиру"), KeyboardButton("🤖 Команды")],
+    [KeyboardButton("👑 Админ")],
+], resize_keyboard=True)
+
+def get_menu(telegram_id):
+    return ADMIN_MENU if str(telegram_id) == ADMIN_ID else MENU
+
+COMMANDS_TEXT = """🏠 Pater AI — всё что я умею:
+
+🏠 Квартиры:
+"добавить 334 кв" — добавить квартиру
+"удалить 1кв" — удалить квартиру
+"переименовать 1кв в Республика" — переименовать
+
+🏃 Заезды:
+"сдал 334кв сутки 15000" — суточный заезд
+"сдал 334кв часовой 5000" — часовой заезд
+"сдал 334кв сутки 15000 01.04" — задним числом
+"выехал 334кв" — гость выехал
+
+📅 Брони:
+"забронировали 334кв Айдар +77001234567 с 15 по 17 апреля"
+"отменить бронь 334кв 22.04"
+
+💰 Расходы:
+"расход горничная 30000 общий" — общий расход
+"расход 334кв ремонт 50000" — расход по квартире
+
+📊 Отчёты:
+"отчёт 334кв" — по конкретной квартире
+"отчёт апрель" — за месяц
+"статус" — кто сдан сейчас
+
+❌ Отмена:
+"отмена" — удалить последнее действие"""
+
+# ─── HTTP helpers ────────────────────────────────────────────────────────────
+
+async def _get(url: str) -> list:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers=HEADERS)
+        data = r.json()
+        return data if isinstance(data, list) else []
+
+async def _post(url: str, payload: dict) -> list:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=HEADERS, json=payload)
+        data = r.json()
+        return data if isinstance(data, list) else []
+
+async def _patch(url: str, payload: dict) -> bool:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.patch(url, headers=HEADERS, json=payload)
+        return r.status_code < 300
+
+async def _delete(url: str) -> bool:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.delete(url, headers=HEADERS)
+        return r.status_code < 300
+
+# ─── DB helpers ───────────────────────────────────────────────────────────────
+
+async def get_or_create_user(telegram_id, name):
+    data = await _get(f"{SUPABASE_URL}/rest/v1/users?telegram_id=eq.{telegram_id}&select=id")
+    if data:
+        return data[0]["id"]
+    result = await _post(f"{SUPABASE_URL}/rest/v1/users", {"telegram_id": telegram_id, "name": name})
+    return result[0]["id"] if result else None
+
+async def get_apartments(user_id):
+    return await _get(
+        f"{SUPABASE_URL}/rest/v1/apartments?user_id=eq.{user_id}&is_active=eq.true&select=id,name&order=name"
+    )
+
+async def find_apartment(user_id, name_part):
+    apts = await get_apartments(user_id)
+    name_part = name_part.lower().strip()
+    # точное совпадение сначала
+    for a in apts:
+        if a["name"].lower() == name_part:
+            return a
+    # частичное совпадение
+    for a in apts:
+        if name_part in a["name"].lower():
+            return a
+    return None
+
+async def add_apartment(user_id, name):
+    result = await _post(f"{SUPABASE_URL}/rest/v1/apartments", {
+        "user_id": user_id, "name": name, "is_active": True
+    })
+    return result[0] if result else None
+
+async def delete_apartment(user_id, name_part):
+    apt = await find_apartment(user_id, name_part)
+    if not apt:
+        return False
+    return await _patch(
+        f"{SUPABASE_URL}/rest/v1/apartments?id=eq.{apt['id']}&user_id=eq.{user_id}",
+        {"is_active": False}
+    )
+
+async def rename_apartment(user_id, old_name, new_name):
+    apt = await find_apartment(user_id, old_name)
+    if not apt:
+        return False
+    return await _patch(
+        f"{SUPABASE_URL}/rest/v1/apartments?id=eq.{apt['id']}&user_id=eq.{user_id}",
+        {"name": new_name}
+    )
+
+async def add_checkin(user_id, apt_id, amount, checkin_type, note="", checkin_date=None):
+    payload = {
+        "user_id": user_id,
+        "apartment_id": apt_id,
+        "amount": amount,
+        "type": checkin_type,
+        "note": note,
+        "check_in": checkin_date or datetime.now().isoformat()
+    }
+    return await _post(f"{SUPABASE_URL}/rest/v1/checkins", payload)
+
+async def checkout_apartment(user_id, apt_id):
+    return await _patch(
+        f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt_id}&check_out=is.null",
+        {"check_out": datetime.now().isoformat()}
+    )
+
+async def get_active_checkin(user_id, apt_id):
+    data = await _get(
+        f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt_id}"
+        f"&check_out=is.null&select=id,amount,type,check_in&order=check_in.desc&limit=1"
+    )
+    return data[0] if data else None
+
+async def add_booking(user_id, apt_id, guest_name, phone, check_in, check_out, amount=0):
+    return await _post(f"{SUPABASE_URL}/rest/v1/bookings", {
+        "user_id": user_id,
+        "apartment_id": apt_id,
+        "guest_name": guest_name,
+        "phone": phone,
+        "check_in": check_in,
+        "check_out": check_out,
+        "amount": amount,
+        "status": "confirmed"
+    })
+
+async def get_bookings(user_id):
+    today = date.today().isoformat()
+    return await _get(
+        f"{SUPABASE_URL}/rest/v1/bookings?user_id=eq.{user_id}&check_out=gte.{today}"
+        f"&status=eq.confirmed&select=id,guest_name,phone,check_in,check_out,amount,apartment_id"
+        f"&order=check_in"
+    )
+
+async def add_expense(user_id, amount, category, comment, apt_id=None, is_shared=False):
+    return await _post(f"{SUPABASE_URL}/rest/v1/expenses", {
+        "user_id": user_id,
+        "apartment_id": apt_id,
+        "amount": amount,
+        "category": category,
+        "comment": comment,
+        "is_shared": is_shared
+    })
+
+async def get_status(user_id):
+    apts = await get_apartments(user_id)
+    if not apts:
+        return "🏠 Квартир пока нет.\n\nДобавь: 'добавить 334 кв'"
+    lines = ["📊 Статус квартир:\n"]
+    for apt in apts:
+        active = await get_active_checkin(user_id, apt["id"])
+        if active:
+            cin = active["check_in"][:10]
+            t = "часовой" if active["type"] == "hourly" else "суточный"
+            lines.append(f"🔴 {apt['name']} — занята ({t} с {cin})")
+        else:
+            lines.append(f"🟢 {apt['name']} — свободна")
+    return "\n".join(lines)
+
+async def get_monthly_report(user_id, year=None, month=None):
+    now = datetime.now()
+    year = year or now.year
+    month = month or now.month
+    start = f"{year}-{month:02d}-01T00:00:00"
+    end = f"{year+1}-01-01T00:00:00" if month == 12 else f"{year}-{month+1:02d}-01T00:00:00"
+
+    checkins = await _get(
+        f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}"
+        f"&check_in=gte.{start}&check_in=lt.{end}"
+        f"&select=amount,type,apartment_id&order=check_in"
+    )
+    expenses = await _get(
+        f"{SUPABASE_URL}/rest/v1/expenses?user_id=eq.{user_id}"
+        f"&created_at=gte.{start}&created_at=lt.{end}"
+        f"&select=amount,category,comment,apartment_id,is_shared"
+    )
+    apts = await get_apartments(user_id)
+
+    total_income  = sum(float(c["amount"]) for c in checkins)
+    total_expense = sum(float(e["amount"]) for e in expenses)
+
+    lines = [f"💰 Отчёт за {year}-{month:02d}\n"]
+    lines.append(f"✅ Доходы: {total_income:,.0f} ₸")
+    lines.append(f"❌ Расходы: {total_expense:,.0f} ₸")
+    lines.append(f"💵 Прибыль: {total_income - total_expense:,.0f} ₸\n")
+
+    if apts:
+        lines.append("По квартирам:")
+        for apt in apts:
+            apt_income = sum(float(c["amount"]) for c in checkins if c.get("apartment_id") == apt["id"])
+            if apt_income > 0:
+                lines.append(f"  🏠 {apt['name']}: {apt_income:,.0f} ₸")
+
+    return "\n".join(lines)
+
+async def get_apt_report(user_id, apt):
+    now = datetime.now()
+    start = f"{now.year}-{now.month:02d}-01T00:00:00"
+    checkins = await _get(
+        f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt['id']}"
+        f"&check_in=gte.{start}&select=amount,type,check_in&order=check_in.desc"
+    )
+    expenses = await _get(
+        f"{SUPABASE_URL}/rest/v1/expenses?user_id=eq.{user_id}&apartment_id=eq.{apt['id']}"
+        f"&created_at=gte.{start}&select=amount,comment"
+    )
+    income  = sum(float(c["amount"]) for c in checkins)
+    expense = sum(float(e["amount"]) for e in expenses)
+    lines = [f"📊 {apt['name']} — отчёт за месяц\n"]
+    lines.append(f"✅ Доходы: {income:,.0f} ₸")
+    lines.append(f"❌ Расходы: {expense:,.0f} ₸")
+    lines.append(f"💵 Прибыль: {income - expense:,.0f} ₸")
+    lines.append(f"📝 Заездов: {len(checkins)}")
+    return "\n".join(lines)
+
+# ─── Date parser ──────────────────────────────────────────────────────────────
+
+def parse_date(date_str: str):
+    """Пробует распарсить строку как дату. Возвращает datetime или None."""
+    date_str = date_str.strip()
+    for fmt in ["%d.%m", "%d.%m.%Y", "%d.%m.%y"]:
+        try:
+            d = datetime.strptime(date_str, fmt)
+            if fmt in ("%d.%m",):
+                d = d.replace(year=datetime.now().year)
+            return d
+        except ValueError:
+            pass
+    return None
+
+def is_date_token(token: str) -> bool:
+    """True если токен похож на дату (содержит точку и цифры)."""
+    return "." in token and any(c.isdigit() for c in token)
+
+def is_amount_token(token: str) -> bool:
+    """True если токен похож на сумму (чисто цифры, возможно с запятой)."""
+    cleaned = token.replace(",", "").replace(" ", "")
+    return cleaned.isdigit() and len(cleaned) > 0
+
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+
+async def send_booking_reminders(app):
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    bookings = await _get(
+        f"{SUPABASE_URL}/rest/v1/bookings?check_in=eq.{tomorrow}&status=eq.confirmed"
+        f"&select=user_id,guest_name,phone,check_in,check_out,apartment_id"
+    )
+    for b in bookings:
+        uid = b["user_id"]
+        user = await _get(f"{SUPABASE_URL}/rest/v1/users?id=eq.{uid}&select=telegram_id")
+        if not user:
+            continue
+        tid = user[0]["telegram_id"]
+        apt = await _get(f"{SUPABASE_URL}/rest/v1/apartments?id=eq.{b['apartment_id']}&select=name")
+        apt_name = apt[0]["name"] if apt else "?"
+        try:
+            await app.bot.send_message(
+                chat_id=tid,
+                text=(f"📅 Напоминание о заезде завтра!\n\n"
+                      f"🏠 {apt_name}\n"
+                      f"👤 {b['guest_name']}\n"
+                      f"📞 {b['phone']}\n"
+                      f"📆 {b['check_in']} → {b['check_out']}")
+            )
+        except Exception as e:
+            logger.warning(f"Напоминание не отправлено {tid}: {e}")
+
+# ─── Handlers ─────────────────────────────────────────────────────────────────
+
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = str(update.effective_user.id)
+    name = update.effective_user.full_name
+    await get_or_create_user(telegram_id, name)
+    menu = get_menu(telegram_id)
+    await update.message.reply_text(
+        f"👋 Привет, {name}!\n\n"
+        f"🏠 Я Pater AI — помогаю управлять посуточными квартирами.\n\n"
+        f"Начни с добавления квартир:\n"
+        f"'добавить Мангилик ел 52'\n\n"
+        f"Нажми 🤖 Команды чтобы увидеть всё что я умею.",
+        reply_markup=menu
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = str(update.effective_user.id)
+    name = update.effective_user.full_name
+
+    if is_rate_limited(telegram_id):
+        await update.message.reply_text("⏳ Подожди секунду...")
+        return
+
+    text = update.message.text.strip()
+    text_lower = text.lower()
+    menu = get_menu(telegram_id)
+    user_id = await get_or_create_user(telegram_id, name)
+
+    if user_id is None:
+        await update.message.reply_text("Ошибка. Попробуй ещё раз.")
+        return
+
+    # ── Команды ──────────────────────────────────────────────────────────────
+    if text_lower in ["🤖 команды", "команды"]:
+        await update.message.reply_text(COMMANDS_TEXT, reply_markup=menu)
+        return
+
+    # ── Мои квартиры ─────────────────────────────────────────────────────────
+    if text_lower in ["🏠 мои квартиры", "мои квартиры", "квартиры"]:
+        apts = await get_apartments(user_id)
+        if not apts:
+            await update.message.reply_text("🏠 Квартир пока нет.\n\nДобавь: 'добавить 334 кв'", reply_markup=menu)
+        else:
+            lines = ["🏠 Твои квартиры:\n"] + [f"  • {a['name']}" for a in apts]
+            await update.message.reply_text("\n".join(lines), reply_markup=menu)
+        return
+
+    # ── Статус ───────────────────────────────────────────────────────────────
+    if text_lower in ["📊 статус", "статус"]:
+        await update.message.reply_text(await get_status(user_id), reply_markup=menu)
+        return
+
+    # ── Отчёт за месяц ───────────────────────────────────────────────────────
+    if text_lower in ["💰 отчёт за месяц", "отчёт за месяц", "отчет за месяц"]:
+        await update.message.reply_text(await get_monthly_report(user_id), reply_markup=menu)
+        return
+
+    # ── Брони ────────────────────────────────────────────────────────────────
+    if text_lower in ["📅 брони", "брони"]:
+        bookings = await get_bookings(user_id)
+        if not bookings:
+            await update.message.reply_text("📅 Активных броней нет.", reply_markup=menu)
+        else:
+            apts = await get_apartments(user_id)
+            apt_map = {a["id"]: a["name"] for a in apts}
+            lines = ["📅 Активные брони:\n"]
+            for b in bookings:
+                apt_name = apt_map.get(b["apartment_id"], "?")
+                lines.append(f"🏠 {apt_name}")
+                lines.append(f"  👤 {b['guest_name']} {b['phone']}")
+                lines.append(f"  📆 {b['check_in']} → {b['check_out']}\n")
+            await update.message.reply_text("\n".join(lines), reply_markup=menu)
+        return
+
+    # ── Добавить квартиру (кнопка) ───────────────────────────────────────────
+    if text_lower in ["➕ добавить квартиру", "добавить квартиру"]:
+        await update.message.reply_text("Напиши название квартиры:\n'добавить 334 кв'", reply_markup=menu)
+        return
+
+    # ── Добавить квартиру (команда) ──────────────────────────────────────────
+    if text_lower.startswith("добавить "):
+        apt_name = text[9:].strip()
+        if not apt_name:
+            await update.message.reply_text("Напиши название: 'добавить 334 кв'", reply_markup=menu)
+            return
+        result = await add_apartment(user_id, apt_name)
+        if result:
+            await update.message.reply_text(f"✅ Квартира '{apt_name}' добавлена!", reply_markup=menu)
+        else:
+            await update.message.reply_text("Ошибка. Попробуй снова.", reply_markup=menu)
+        return
+
+    # ── Удалить квартиру ─────────────────────────────────────────────────────
+    if text_lower.startswith("удалить "):
+        apt_name = text[8:].strip()
+        success = await delete_apartment(user_id, apt_name)
+        msg = "✅ Квартира удалена." if success else f"Квартира '{apt_name}' не найдена."
+        await update.message.reply_text(msg, reply_markup=menu)
+        return
+
+    # ── Переименовать ────────────────────────────────────────────────────────
+    if text_lower.startswith("переименовать ") and " в " in text_lower:
+        parts = text[14:].split(" в ", 1)
+        if len(parts) == 2:
+            old, new = parts[0].strip(), parts[1].strip()
+            success = await rename_apartment(user_id, old, new)
+            msg = f"✅ Переименовано в '{new}'" if success else f"Квартира '{old}' не найдена."
+            await update.message.reply_text(msg, reply_markup=menu)
+        return
+
+    # ── Заезд: сдал ──────────────────────────────────────────────────────────
+    if text_lower.startswith("сдал "):
+        raw = text[5:].strip()
+        tokens = raw.split()
+
+        if len(tokens) < 3:
+            await update.message.reply_text(
+                "Формат: 'сдал 334кв сутки 15000' или 'сдал 3 кв часовой 5000 01.03'",
+                reply_markup=menu)
+            return
+
+        # Ключевые слова типа заезда
+        type_keywords = {"сутки", "суточный", "суточная", "часовой", "час", "часов", "часовая"}
+
+        # Разделяем токены: всё до ключевого слова — название квартиры,
+        # всё после — тип, сумма, дата
+        apt_tokens = []
+        rest_tokens = []
+        found_type = False
+        for tok in tokens:
+            if tok.lower() in type_keywords and not found_type:
+                found_type = True
+                rest_tokens.append(tok)
+            elif found_type:
+                rest_tokens.append(tok)
+            else:
+                apt_tokens.append(tok)
+
+        if not found_type:
+            await update.message.reply_text(
+                "Укажи тип: 'сутки' или 'часовой'\nПример: 'сдал 334кв сутки 15000'",
+                reply_markup=menu)
+            return
+
+        apt_name = " ".join(apt_tokens).strip()
+        apt = await find_apartment(user_id, apt_name)
+        if not apt:
+            await update.message.reply_text(
+                f"Квартира '{apt_name}' не найдена.\n\nНажми 🏠 Мои квартиры чтобы увидеть список.",
+                reply_markup=menu)
+            return
+
+        # Тип заезда
+        checkin_type = "daily"
+        for tok in rest_tokens:
+            if tok.lower() in {"часовой", "час", "часов", "часовая"}:
+                checkin_type = "hourly"
+                break
+
+        # Парсим сумму и дату из rest_tokens
+        # Стратегия: дата — токен с точками (01.03), сумма — чисто цифровой токен
+        amount = 0
+        checkin_date = None
+
+        for tok in rest_tokens:
+            if tok.lower() in type_keywords:
+                continue
+            # Пробуем как дату
+            if is_date_token(tok):
+                d = parse_date(tok)
+                if d:
+                    checkin_date = d.isoformat()
+                    continue
+            # Пробуем как сумму
+            if is_amount_token(tok):
+                val = float(tok.replace(",", ""))
+                # Берём наибольшее число как сумму
+                # (защита от случая когда номер квартиры попадает в rest)
+                if val > amount:
+                    amount = val
+
+        if amount <= 0:
+            await update.message.reply_text(
+                "Укажи сумму.\nПример: 'сдал 334кв сутки 15000'",
+                reply_markup=menu)
+            return
+
+        await add_checkin(user_id, apt["id"], amount, checkin_type, checkin_date=checkin_date)
+        type_text = "часовой" if checkin_type == "hourly" else "суточный"
+        date_text = f" ({checkin_date[:10]})" if checkin_date else ""
+        await update.message.reply_text(
+            f"✅ Записан заезд{date_text}!\n\n🏠 {apt['name']}\n💰 {amount:,.0f} ₸ — {type_text}",
+            reply_markup=menu)
+        return
+
+    # ── Выезд ────────────────────────────────────────────────────────────────
+    if text_lower.startswith("выехал "):
+        apt_name = text[7:].strip()
+        apt = await find_apartment(user_id, apt_name)
+        if not apt:
+            await update.message.reply_text(f"Квартира '{apt_name}' не найдена.", reply_markup=menu)
+            return
+        active = await get_active_checkin(user_id, apt["id"])
+        if not active:
+            await update.message.reply_text(f"🟢 {apt['name']} уже свободна.", reply_markup=menu)
+            return
+        await checkout_apartment(user_id, apt["id"])
+        await update.message.reply_text(
+            f"✅ Гость выехал!\n\n🏠 {apt['name']} — теперь свободна 🟢",
+            reply_markup=menu)
+        return
+
+    # ── Отменить бронь ───────────────────────────────────────────────────────
+    if text_lower.startswith("отменить бронь "):
+        parts = text[15:].strip().split()
+        apt_name = parts[0] if parts else ""
+        apt = await find_apartment(user_id, apt_name)
+        if not apt:
+            await update.message.reply_text(f"Квартира '{apt_name}' не найдена.", reply_markup=menu)
+            return
+        cancel_date = None
+        if len(parts) > 1:
+            d = parse_date(parts[1])
+            if d:
+                cancel_date = d.date().isoformat()
+        if cancel_date:
+            bookings = await _get(
+                f"{SUPABASE_URL}/rest/v1/bookings?user_id=eq.{user_id}"
+                f"&apartment_id=eq.{apt['id']}&check_in=eq.{cancel_date}&status=eq.confirmed&select=id"
+            )
+        else:
+            bookings = await _get(
+                f"{SUPABASE_URL}/rest/v1/bookings?user_id=eq.{user_id}"
+                f"&apartment_id=eq.{apt['id']}&status=eq.confirmed&select=id&order=check_in.desc&limit=1"
+            )
+        if not bookings:
+            await update.message.reply_text("Бронь не найдена.", reply_markup=menu)
+            return
+        await _patch(f"{SUPABASE_URL}/rest/v1/bookings?id=eq.{bookings[0]['id']}", {"status": "cancelled"})
+        date_text = f" на {cancel_date}" if cancel_date else ""
+        await update.message.reply_text(
+            f"✅ Бронь{date_text} для {apt['name']} отменена.", reply_markup=menu)
+        return
+
+    # ── Бронь ────────────────────────────────────────────────────────────────
+    if text_lower.startswith("забронировали ") or text_lower.startswith("бронь "):
+        parts = text.split()
+        if len(parts) < 6:
+            await update.message.reply_text(
+                "Формат:\n'забронировали 334кв Айдар +77001234567 с 15 по 17 апреля'",
+                reply_markup=menu)
+            return
+        apt_name = parts[1]
+        apt = await find_apartment(user_id, apt_name)
+        if not apt:
+            await update.message.reply_text(f"Квартира '{apt_name}' не найдена.", reply_markup=menu)
+            return
+
+        guest_name = parts[2] if len(parts) > 2 else "Гость"
+        phone = parts[3] if len(parts) > 3 else ""
+
+        check_in_date  = date.today().isoformat()
+        check_out_date = (date.today() + timedelta(days=1)).isoformat()
+
+        for i, p in enumerate(parts):
+            if p.lower() in ["с", "от"] and i + 1 < len(parts):
+                d = parse_date(parts[i + 1])
+                if d:
+                    check_in_date = d.date().isoformat()
+            if p.lower() in ["по", "до"] and i + 1 < len(parts):
+                d = parse_date(parts[i + 1])
+                if d:
+                    check_out_date = d.date().isoformat()
+
+        await add_booking(user_id, apt["id"], guest_name, phone, check_in_date, check_out_date)
+        await update.message.reply_text(
+            f"📅 Бронь записана!\n\n🏠 {apt['name']}\n👤 {guest_name}\n📞 {phone}\n"
+            f"📆 {check_in_date} → {check_out_date}",
+            reply_markup=menu)
+        return
+
+    # ── Расход ───────────────────────────────────────────────────────────────
+    if text_lower.startswith("расход "):
+        parts = text[7:].strip().split()
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "Формат:\n'расход горничная 30000 общий'\n'расход 334кв ремонт 50000'",
+                reply_markup=menu)
+            return
+
+        is_shared = "общий" in text_lower or "общ" in text_lower
+        amount = 0
+        for p in parts:
+            try:
+                amount = float(p.replace(",", ""))
+                break
+            except ValueError:
+                pass
+
+        if amount <= 0:
+            await update.message.reply_text("Укажи сумму.", reply_markup=menu)
+            return
+
+        apt = None
+        if not is_shared:
+            apt = await find_apartment(user_id, parts[0])
+
+        category = parts[0] if not apt else (parts[1] if len(parts) > 1 else "прочее")
+        comment  = " ".join(parts)
+
+        await add_expense(
+            user_id, amount, category, comment,
+            apt_id=apt["id"] if apt else None,
+            is_shared=is_shared
+        )
+        apt_text = f"\n🏠 {apt['name']}" if apt else "\n📦 Общий расход"
+        await update.message.reply_text(
+            f"❌ Расход записан!{apt_text}\n💰 {amount:,.0f} ₸ — {category}",
+            reply_markup=menu)
+        return
+
+    # ── Отчёт по квартире / месяцу ───────────────────────────────────────────
+    if text_lower.startswith("отчёт ") or text_lower.startswith("отчет "):
+        query = text.split(" ", 1)[1].strip()
+        months = {
+            "январь": 1, "февраль": 2, "март": 3, "апрель": 4,
+            "май": 5, "июнь": 6, "июль": 7, "август": 8,
+            "сентябрь": 9, "октябрь": 10, "ноябрь": 11, "декабрь": 12
+        }
+        if query.lower() in months:
+            m = months[query.lower()]
+            await update.message.reply_text(
+                await get_monthly_report(user_id, month=m), reply_markup=menu)
+        else:
+            apt = await find_apartment(user_id, query)
+            if apt:
+                await update.message.reply_text(await get_apt_report(user_id, apt), reply_markup=menu)
+            else:
+                await update.message.reply_text(f"Квартира '{query}' не найдена.", reply_markup=menu)
+        return
+
+    # ── Отмена последнего заезда ─────────────────────────────────────────────
+    if text_lower in ["отмена", "отменить"]:
+        data = await _get(
+            f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&order=created_at.desc&limit=1&select=id"
+        )
+        if data:
+            await _delete(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{data[0]['id']}")
+            await update.message.reply_text("↩️ Последний заезд удалён.", reply_markup=menu)
+        else:
+            await update.message.reply_text("Нечего отменять.", reply_markup=menu)
+        return
+
+    # ── Админ ────────────────────────────────────────────────────────────────
+    if str(telegram_id) == ADMIN_ID and text_lower in ["👑 админ", "админ"]:
+        users = await _get(f"{SUPABASE_URL}/rest/v1/users?select=id,name,telegram_id")
+        lines = [f"👑 Pater AI — пользователи\n\n👥 Всего: {len(users)}\n"]
+        for u in users:
+            lines.append(f"• {u.get('name','?')} ({u.get('telegram_id','')})")
+        await update.message.reply_text("\n".join(lines), reply_markup=menu)
+        return
+
+    # ── Не понял ─────────────────────────────────────────────────────────────
+    await update.message.reply_text(
+        "Не понял. Нажми 🤖 Команды чтобы увидеть все доступные команды.",
+        reply_markup=menu)
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+async def start():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    scheduler = AsyncIOScheduler(timezone=KZ_TZ)
+    scheduler.add_job(send_booking_reminders, "cron", hour=9, minute=0, args=[app])
+    scheduler.start()
+
+    logger.info("✅ Pater AI запущен!")
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(start())
