@@ -21,7 +21,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 SUPABASE_URL   = os.environ["SUPABASE_URL"]
 SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 ADMIN_ID       = "539648155"
-KZ_TZ          = pytz.timezone("Asia/Almaty")
+KZ_TZ          = pytz.timezone("Asia/Almaty")  # UTC+5 — Астана/Алматы
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -29,6 +29,10 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=representation"
 }
+
+def now_kz() -> datetime:
+    """Текущее время по Астане без timezone info (для записи в базу)"""
+    return datetime.now(KZ_TZ).replace(tzinfo=None)
 
 _last_msg: dict = defaultdict(float)
 
@@ -150,13 +154,13 @@ async def add_checkin(user_id, apt_id, amount, checkin_type, note="", checkin_da
     return await _post(f"{SUPABASE_URL}/rest/v1/checkins", {
         "user_id": user_id, "apartment_id": apt_id, "amount": amount,
         "type": checkin_type, "note": note,
-        "check_in": checkin_date or datetime.now().isoformat()
+        "check_in": checkin_date or now_kz().isoformat()  # время по Астане
     })
 
 async def checkout_apartment(user_id, apt_id):
     return await _patch(
         f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt_id}&check_out=is.null",
-        {"check_out": datetime.now().isoformat()})
+        {"check_out": now_kz().isoformat()})  # время по Астане
 
 async def get_active_checkin(user_id, apt_id):
     data = await _get(f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt_id}&check_out=is.null&select=id,amount,type,check_in,note&order=check_in.desc&limit=1")
@@ -225,7 +229,7 @@ async def get_status(user_id):
     return "\n".join(lines)
 
 async def get_monthly_report(user_id, year=None, month=None):
-    now = datetime.now()
+    now = now_kz()
     year = year or now.year
     month = month or now.month
     start = f"{year}-{month:02d}-01T00:00:00"
@@ -248,7 +252,7 @@ async def get_monthly_report(user_id, year=None, month=None):
     return "\n".join(lines)
 
 async def get_apt_report(user_id, apt):
-    now = datetime.now()
+    now = now_kz()
     start = f"{now.year}-{now.month:02d}-01T00:00:00"
     checkins = await _get(f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt['id']}&check_in=gte.{start}&select=amount,type,check_in&order=check_in.desc")
     expenses = await _get(f"{SUPABASE_URL}/rest/v1/expenses?user_id=eq.{user_id}&apartment_id=eq.{apt['id']}&created_at=gte.{start}&select=amount,comment")
@@ -267,7 +271,7 @@ def parse_date(date_str):
         try:
             d = datetime.strptime(date_str, fmt)
             if fmt == "%d.%m":
-                d = d.replace(year=datetime.now().year)
+                d = d.replace(year=now_kz().year)
             return d
         except ValueError:
             pass
@@ -281,17 +285,12 @@ def is_amount_token(token):
     return cleaned.isdigit() and len(cleaned) > 0
 
 def parse_hours_token(token):
-    """Парсит токен типа '2ч', '3ч' → возвращает int или None"""
     token = token.lower().strip()
     if token.endswith("ч") and token[:-1].isdigit():
         return int(token[:-1])
     return None
 
 async def undo_last_action(user_id):
-    """
-    Удаляет последнее действие — заезд или расход,
-    смотря что было записано позже по времени.
-    """
     last_checkin = await _get(
         f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}"
         f"&order=created_at.desc&limit=1&select=id,created_at,apartment_id"
@@ -304,7 +303,6 @@ async def undo_last_action(user_id):
     checkin_time = last_checkin[0]["created_at"] if last_checkin else None
     expense_time = last_expense[0]["created_at"] if last_expense else None
 
-    # Сравниваем что было позже
     if checkin_time and expense_time:
         if checkin_time >= expense_time:
             await _delete(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{last_checkin[0]['id']}")
@@ -324,8 +322,8 @@ async def undo_last_action(user_id):
         return None, None
 
 async def auto_checkout_daily(app):
-    """Автовыселение суточных заездов в 12:00"""
-    now = datetime.now(KZ_TZ).replace(tzinfo=None)
+    """Автовыселение суточных заездов в 12:00 по Астане"""
+    now = now_kz()
     logger.info(f"⏰ Запуск автовыселения суточных в {now}")
 
     checkins = await _get(
@@ -358,7 +356,7 @@ async def auto_checkout_daily(app):
 
 async def auto_checkout_hourly(app):
     """Автовыселение почасовых заездов каждые 15 минут"""
-    now = datetime.now(KZ_TZ).replace(tzinfo=None)
+    now = now_kz()
 
     checkins = await _get(
         f"{SUPABASE_URL}/rest/v1/checkins"
@@ -544,7 +542,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Укажи сумму.\nПример: 'сдал 334 сутки 15000'", reply_markup=menu); return
 
         note = f"{hours}ч" if checkin_type == "hourly" else ""
-        check_in_dt = datetime.fromisoformat(checkin_date) if checkin_date else datetime.now()
+        check_in_dt = datetime.fromisoformat(checkin_date) if checkin_date else now_kz()
 
         await add_checkin(user_id, apt["id"], amount, checkin_type, note=note,
                           checkin_date=checkin_date or check_in_dt.isoformat())
@@ -605,8 +603,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Апартамент '{parts[1]}' не найден.", reply_markup=menu); return
         guest_name = parts[2] if len(parts) > 2 else "Гость"
         phone = parts[3] if len(parts) > 3 else ""
-        check_in_date  = date.today().isoformat()
-        check_out_date = (date.today() + timedelta(days=1)).isoformat()
+        check_in_date  = now_kz().date().isoformat()
+        check_out_date = (now_kz().date() + timedelta(days=1)).isoformat()
         for i, p in enumerate(parts):
             if p.lower() in ["с", "от"] and i + 1 < len(parts):
                 d = parse_date(parts[i+1])
