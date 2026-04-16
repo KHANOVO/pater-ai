@@ -74,7 +74,9 @@ COMMANDS_TEXT = """🏠 Pater AI — всё что я умею:
 
 💰 Расходы:
 "расход горничная 30000 общий" — общий расход
+"расход горничная 30000 общий 15.03" — с датой
 "расход 334 ремонт 50000" — расход по апартаменту
+"расход 334 ремонт 50000 20.03" — с датой
 
 📊 Отчёты:
 "отчёт 334" — по конкретному апартаменту
@@ -170,11 +172,14 @@ async def get_bookings(user_id):
     today = date.today().isoformat()
     return await _get(f"{SUPABASE_URL}/rest/v1/bookings?user_id=eq.{user_id}&check_out=gte.{today}&status=eq.confirmed&select=id,guest_name,phone,check_in,check_out,amount,apartment_id&order=check_in")
 
-async def add_expense(user_id, amount, category, comment, apt_id=None, is_shared=False):
-    return await _post(f"{SUPABASE_URL}/rest/v1/expenses", {
+async def add_expense(user_id, amount, category, comment, apt_id=None, is_shared=False, expense_date=None):
+    payload = {
         "user_id": user_id, "apartment_id": apt_id, "amount": amount,
         "category": category, "comment": comment, "is_shared": is_shared
-    })
+    }
+    if expense_date:
+        payload["created_at"] = expense_date
+    return await _post(f"{SUPABASE_URL}/rest/v1/expenses", payload)
 
 async def get_status(user_id):
     apts = await get_apartments(user_id)
@@ -251,16 +256,12 @@ def get_logical_checkout(check_in_dt: datetime) -> datetime:
     """
     Логика выезда:
     - Заехал с 00:00 до 05:59 (ночью) — выезд в ЭТОТ же день в 12:00
-      (ночь считается как предыдущий день)
     - Заехал с 06:00 до 23:59 — выезд на СЛЕДУЮЩИЙ день в 12:00
     """
     if check_in_dt.hour < 6:
-        # Ночной заезд — выезд сегодня в 12:00
         checkout_date = check_in_dt.date()
     else:
-        # Дневной/вечерний заезд — выезд завтра в 12:00
         checkout_date = check_in_dt.date() + timedelta(days=1)
-
     return datetime.combine(checkout_date, datetime.strptime("12:00", "%H:%M").time())
 
 async def auto_checkout_daily(app):
@@ -268,7 +269,6 @@ async def auto_checkout_daily(app):
     now = datetime.now(KZ_TZ).replace(tzinfo=None)
     logger.info(f"⏰ Запуск автовыселения в {now}")
 
-    # Получаем все открытые суточные заезды
     checkins = await _get(
         f"{SUPABASE_URL}/rest/v1/checkins"
         f"?check_out=is.null&type=eq.daily"
@@ -279,7 +279,6 @@ async def auto_checkout_daily(app):
         check_in_dt = datetime.fromisoformat(c["check_in"])
         expected_checkout = get_logical_checkout(check_in_dt)
 
-        # Выселяем только если время выезда уже наступило
         if now >= expected_checkout:
             await _patch(
                 f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{c['id']}",
@@ -287,7 +286,6 @@ async def auto_checkout_daily(app):
             )
             logger.info(f"✅ Автовыселение: checkin_id={c['id']}, apt={c['apartment_id']}")
 
-            # Уведомляем пользователя
             user = await _get(f"{SUPABASE_URL}/rest/v1/users?id=eq.{c['user_id']}&select=telegram_id")
             apt  = await _get(f"{SUPABASE_URL}/rest/v1/apartments?id=eq.{c['apartment_id']}&select=name")
             if user and apt:
@@ -443,7 +441,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         type_text = "почасово" if checkin_type == "hourly" else "суточный"
         date_text = f" ({checkin_date[:10]})" if checkin_date else ""
 
-        # Показываем ожидаемое время выезда для суточных
         if checkin_type == "daily":
             check_in_dt = datetime.fromisoformat(checkin_date) if checkin_date else datetime.now()
             checkout_dt = get_logical_checkout(check_in_dt)
@@ -512,21 +509,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text_lower.startswith("расход "):
         parts = text[7:].strip().split()
         if len(parts) < 2:
-            await update.message.reply_text("Формат:\n'расход горничная 30000 общий'\n'расход 334 ремонт 50000'", reply_markup=menu); return
+            await update.message.reply_text(
+                "Формат:\n'расход горничная 30000 общий'\n'расход горничная 30000 общий 15.03'\n'расход 334 ремонт 50000'\n'расход 334 ремонт 50000 20.03'",
+                reply_markup=menu); return
+
         is_shared = "общий" in text_lower or "общ" in text_lower
+
+        # Ищем сумму и дату среди токенов
         amount = 0
+        expense_date = None
         for p in parts:
-            try: amount = float(p.replace(",", "")); break
-            except ValueError: pass
+            if is_date_token(p):
+                d = parse_date(p)
+                if d:
+                    expense_date = d.isoformat()
+                continue
+            if is_amount_token(p):
+                try:
+                    val = float(p.replace(",", ""))
+                    if val > amount:
+                        amount = val
+                except ValueError:
+                    pass
+
         if amount <= 0:
             await update.message.reply_text("Укажи сумму.", reply_markup=menu); return
+
         apt = None
         if not is_shared:
             apt = await find_apartment(user_id, parts[0])
+
         category = parts[0] if not apt else (parts[1] if len(parts) > 1 else "прочее")
-        await add_expense(user_id, amount, category, " ".join(parts), apt_id=apt["id"] if apt else None, is_shared=is_shared)
+
+        await add_expense(
+            user_id, amount, category, " ".join(parts),
+            apt_id=apt["id"] if apt else None,
+            is_shared=is_shared,
+            expense_date=expense_date
+        )
+
         apt_text = f"\n🏠 {apt['name']}" if apt else "\n📦 Общий расход"
-        await update.message.reply_text(f"❌ Расход записан!{apt_text}\n💰 {amount:,.0f} ₸ — {category}", reply_markup=menu); return
+        date_text = f"\n📅 Дата: {expense_date[:10]}" if expense_date else ""
+        await update.message.reply_text(
+            f"❌ Расход записан!{apt_text}\n💰 {amount:,.0f} ₸ — {category}{date_text}",
+            reply_markup=menu); return
 
     if text_lower.startswith("отчёт ") or text_lower.startswith("отчет "):
         query = text.split(" ", 1)[1].strip()
@@ -566,7 +592,7 @@ async def start():
 
     scheduler = AsyncIOScheduler(timezone=KZ_TZ)
     scheduler.add_job(send_booking_reminders, "cron", hour=9, minute=0, args=[app])
-    scheduler.add_job(auto_checkout_daily, "cron", hour=12, minute=0, args=[app])  # автовыселение в 12:00
+    scheduler.add_job(auto_checkout_daily, "cron", hour=12, minute=0, args=[app])
     scheduler.start()
 
     logger.info("✅ Pater AI запущен!")
