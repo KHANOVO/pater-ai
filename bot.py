@@ -247,6 +247,58 @@ def is_amount_token(token):
     cleaned = token.replace(",", "").replace(" ", "")
     return cleaned.isdigit() and len(cleaned) > 0
 
+def get_logical_checkout(check_in_dt: datetime) -> datetime:
+    """
+    Логика выезда:
+    - Заехал с 00:00 до 05:59 (ночью) — выезд в ЭТОТ же день в 12:00
+      (ночь считается как предыдущий день)
+    - Заехал с 06:00 до 23:59 — выезд на СЛЕДУЮЩИЙ день в 12:00
+    """
+    if check_in_dt.hour < 6:
+        # Ночной заезд — выезд сегодня в 12:00
+        checkout_date = check_in_dt.date()
+    else:
+        # Дневной/вечерний заезд — выезд завтра в 12:00
+        checkout_date = check_in_dt.date() + timedelta(days=1)
+
+    return datetime.combine(checkout_date, datetime.strptime("12:00", "%H:%M").time())
+
+async def auto_checkout_daily(app):
+    """Автовыселение суточных заездов в 12:00"""
+    now = datetime.now(KZ_TZ).replace(tzinfo=None)
+    logger.info(f"⏰ Запуск автовыселения в {now}")
+
+    # Получаем все открытые суточные заезды
+    checkins = await _get(
+        f"{SUPABASE_URL}/rest/v1/checkins"
+        f"?check_out=is.null&type=eq.daily"
+        f"&select=id,apartment_id,user_id,check_in"
+    )
+
+    for c in checkins:
+        check_in_dt = datetime.fromisoformat(c["check_in"])
+        expected_checkout = get_logical_checkout(check_in_dt)
+
+        # Выселяем только если время выезда уже наступило
+        if now >= expected_checkout:
+            await _patch(
+                f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{c['id']}",
+                {"check_out": expected_checkout.isoformat()}
+            )
+            logger.info(f"✅ Автовыселение: checkin_id={c['id']}, apt={c['apartment_id']}")
+
+            # Уведомляем пользователя
+            user = await _get(f"{SUPABASE_URL}/rest/v1/users?id=eq.{c['user_id']}&select=telegram_id")
+            apt  = await _get(f"{SUPABASE_URL}/rest/v1/apartments?id=eq.{c['apartment_id']}&select=name")
+            if user and apt:
+                try:
+                    await app.bot.send_message(
+                        chat_id=user[0]["telegram_id"],
+                        text=f"🟢 {apt[0]['name']} — автоматически освобождён (выезд 12:00)"
+                    )
+                except Exception as e:
+                    logger.warning(f"Уведомление не отправлено: {e}")
+
 async def send_booking_reminders(app):
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
     bookings = await _get(f"{SUPABASE_URL}/rest/v1/bookings?check_in=eq.{tomorrow}&status=eq.confirmed&select=user_id,guest_name,phone,check_in,check_out,apartment_id")
@@ -390,7 +442,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await add_checkin(user_id, apt["id"], amount, checkin_type, checkin_date=checkin_date)
         type_text = "почасово" if checkin_type == "hourly" else "суточный"
         date_text = f" ({checkin_date[:10]})" if checkin_date else ""
-        await update.message.reply_text(f"✅ Записан заезд{date_text}!\n\n🏠 {apt['name']}\n💰 {amount:,.0f} ₸ — {type_text}", reply_markup=menu); return
+
+        # Показываем ожидаемое время выезда для суточных
+        if checkin_type == "daily":
+            check_in_dt = datetime.fromisoformat(checkin_date) if checkin_date else datetime.now()
+            checkout_dt = get_logical_checkout(check_in_dt)
+            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%d.%m в 12:00')}"
+        else:
+            checkout_info = ""
+
+        await update.message.reply_text(
+            f"✅ Записан заезд{date_text}!\n\n🏠 {apt['name']}\n💰 {amount:,.0f} ₸ — {type_text}{checkout_info}",
+            reply_markup=menu
+        ); return
 
     if text_lower.startswith("выехал "):
         apt_name = text[7:].strip()
@@ -499,9 +563,12 @@ async def start():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     scheduler = AsyncIOScheduler(timezone=KZ_TZ)
     scheduler.add_job(send_booking_reminders, "cron", hour=9, minute=0, args=[app])
+    scheduler.add_job(auto_checkout_daily, "cron", hour=12, minute=0, args=[app])  # автовыселение в 12:00
     scheduler.start()
+
     logger.info("✅ Pater AI запущен!")
     async with app:
         await app.start()
