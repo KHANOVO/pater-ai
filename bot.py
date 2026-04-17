@@ -125,14 +125,13 @@ async def get_apartments(user_id):
 
 async def find_apartment(user_id, name_part):
     """
-    Поиск апартамента по названию.
-    Только точное совпадение — "3" найдёт только "3" или "3 кв",
-    никогда не найдёт "23" или "334".
+    Только точное совпадение по первому слову номера.
+    "3" → только "3 кв", никогда не "23" или "334".
     """
     apts = await get_apartments(user_id)
     name_part = name_part.lower().strip()
 
-    # 1. Точное совпадение с полным названием ("334" → "334")
+    # 1. Точное совпадение с полным названием
     for a in apts:
         if a["name"].lower() == name_part:
             return a
@@ -169,13 +168,32 @@ async def add_checkin(user_id, apt_id, amount, checkin_type, note="", checkin_da
         "check_in": checkin_date or now_kz().isoformat()
     })
 
+async def close_previous_checkin(user_id, apt_id, new_check_in_dt: datetime):
+    """
+    Если есть открытый заезд — закрываем его за минуту до нового заезда.
+    Так в базе никогда не будет двух открытых заездов по одной квартире.
+    """
+    existing = await get_active_checkin(user_id, apt_id)
+    if existing:
+        close_time = (new_check_in_dt - timedelta(minutes=1)).isoformat()
+        await _patch(
+            f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{existing['id']}",
+            {"check_out": close_time}
+        )
+
 async def checkout_apartment(user_id, apt_id):
     return await _patch(
         f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt_id}&check_out=is.null",
         {"check_out": now_kz().isoformat()})
 
 async def get_active_checkin(user_id, apt_id):
-    data = await _get(f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&apartment_id=eq.{apt_id}&check_out=is.null&select=id,amount,type,check_in,note&order=check_in.desc&limit=1")
+    """Последний открытый заезд по квартире"""
+    data = await _get(
+        f"{SUPABASE_URL}/rest/v1/checkins"
+        f"?user_id=eq.{user_id}&apartment_id=eq.{apt_id}"
+        f"&check_out=is.null&select=id,amount,type,check_in,note"
+        f"&order=check_in.desc&limit=1"
+    )
     return data[0] if data else None
 
 async def add_booking(user_id, apt_id, guest_name, phone, check_in, check_out, amount=0):
@@ -305,7 +323,6 @@ async def undo_last_action(user_id):
         f"{SUPABASE_URL}/rest/v1/expenses?user_id=eq.{user_id}"
         f"&order=created_at.desc&limit=1&select=id,created_at,category,amount"
     )
-
     checkin_time = last_checkin[0]["created_at"] if last_checkin else None
     expense_time = last_expense[0]["created_at"] if last_expense else None
 
@@ -328,52 +345,73 @@ async def undo_last_action(user_id):
         return None, None
 
 async def auto_checkout_daily(app):
+    """
+    Автовыселение суточных в 12:00.
+    Только последний открытый заезд каждой квартиры.
+    """
     now = now_kz()
     logger.info(f"⏰ Автовыселение суточных в {now}")
-    checkins = await _get(
-        f"{SUPABASE_URL}/rest/v1/checkins?check_out=is.null&type=eq.daily"
-        f"&select=id,apartment_id,user_id,check_in"
-    )
-    for c in checkins:
-        check_in_dt = datetime.fromisoformat(c["check_in"])
-        expected_checkout = get_logical_checkout(check_in_dt)
-        if now >= expected_checkout:
-            await _patch(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{c['id']}",
-                         {"check_out": expected_checkout.isoformat()})
-            user = await _get(f"{SUPABASE_URL}/rest/v1/users?id=eq.{c['user_id']}&select=telegram_id")
-            apt  = await _get(f"{SUPABASE_URL}/rest/v1/apartments?id=eq.{c['apartment_id']}&select=name")
-            if user and apt:
+
+    users = await _get(f"{SUPABASE_URL}/rest/v1/users?select=id,telegram_id")
+    for user in users:
+        user_id = user["id"]
+        telegram_id = user["telegram_id"]
+        apts = await get_apartments(user_id)
+        for apt in apts:
+            active = await get_active_checkin(user_id, apt["id"])
+            if not active or active["type"] != "daily":
+                continue
+            check_in_dt = datetime.fromisoformat(active["check_in"])
+            expected_checkout = get_logical_checkout(check_in_dt)
+            if now >= expected_checkout:
+                await _patch(
+                    f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{active['id']}",
+                    {"check_out": expected_checkout.isoformat()}
+                )
+                logger.info(f"✅ Выселен: {apt['name']} пользователь {telegram_id}")
                 try:
-                    await app.bot.send_message(chat_id=user[0]["telegram_id"],
-                        text=f"🟢 {apt[0]['name']} — автоматически освобождён (выезд 12:00)")
+                    await app.bot.send_message(
+                        chat_id=telegram_id,
+                        text=f"🟢 {apt['name']} — автоматически освобождён (выезд 12:00)"
+                    )
                 except Exception as e:
                     logger.warning(f"Уведомление не отправлено: {e}")
 
 async def auto_checkout_hourly(app):
+    """
+    Автовыселение почасовых каждые 15 минут.
+    Только последний открытый заезд каждой квартиры.
+    """
     now = now_kz()
-    checkins = await _get(
-        f"{SUPABASE_URL}/rest/v1/checkins?check_out=is.null&type=eq.hourly"
-        f"&select=id,apartment_id,user_id,check_in,note"
-    )
-    for c in checkins:
-        check_in_dt = datetime.fromisoformat(c["check_in"])
-        hours = 2
-        try:
-            note = c.get("note", "")
-            if note and note.endswith("ч"):
-                hours = int(note.replace("ч", "").strip())
-        except:
-            pass
-        expected_checkout = get_hourly_checkout(check_in_dt, hours)
-        if now >= expected_checkout:
-            await _patch(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{c['id']}",
-                         {"check_out": expected_checkout.isoformat()})
-            user = await _get(f"{SUPABASE_URL}/rest/v1/users?id=eq.{c['user_id']}&select=telegram_id")
-            apt  = await _get(f"{SUPABASE_URL}/rest/v1/apartments?id=eq.{c['apartment_id']}&select=name")
-            if user and apt:
+    users = await _get(f"{SUPABASE_URL}/rest/v1/users?select=id,telegram_id")
+    for user in users:
+        user_id = user["id"]
+        telegram_id = user["telegram_id"]
+        apts = await get_apartments(user_id)
+        for apt in apts:
+            active = await get_active_checkin(user_id, apt["id"])
+            if not active or active["type"] != "hourly":
+                continue
+            check_in_dt = datetime.fromisoformat(active["check_in"])
+            hours = 2
+            try:
+                note = active.get("note", "")
+                if note and note.endswith("ч"):
+                    hours = int(note.replace("ч", "").strip())
+            except:
+                pass
+            expected_checkout = get_hourly_checkout(check_in_dt, hours)
+            if now >= expected_checkout:
+                await _patch(
+                    f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{active['id']}",
+                    {"check_out": expected_checkout.isoformat()}
+                )
+                logger.info(f"✅ Почасовой выселен: {apt['name']} пользователь {telegram_id}")
                 try:
-                    await app.bot.send_message(chat_id=user[0]["telegram_id"],
-                        text=f"🟢 {apt[0]['name']} — почасовой заезд завершён (через {hours}ч)")
+                    await app.bot.send_message(
+                        chat_id=telegram_id,
+                        text=f"🟢 {apt['name']} — почасовой заезд завершён (через {hours}ч)"
+                    )
                 except Exception as e:
                     logger.warning(f"Уведомление не отправлено: {e}")
 
@@ -527,6 +565,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note = f"{hours}ч" if checkin_type == "hourly" else ""
         check_in_dt = datetime.fromisoformat(checkin_date) if checkin_date else now_kz()
 
+        # Закрываем предыдущий открытый заезд если есть
+        await close_previous_checkin(user_id, apt["id"], check_in_dt)
+
         await add_checkin(user_id, apt["id"], amount, checkin_type, note=note,
                           checkin_date=checkin_date or check_in_dt.isoformat())
 
@@ -605,8 +646,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=menu); return
 
         is_shared = "общий" in text_lower or "общ" in text_lower
-
-        # Ищем сумму и дату
         amount = 0
         expense_date = None
         for p in parts:
@@ -630,9 +669,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_shared:
             apt = await find_apartment(user_id, parts[0])
 
-        # Категория — первое слово которое не номер квартиры и не сумма и не дата
         if apt:
-            # Ищем категорию после номера квартиры
             apt_number = apt["name"].split()[0].lower()
             category = "прочее"
             for p in parts:
