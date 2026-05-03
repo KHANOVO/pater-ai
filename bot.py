@@ -440,6 +440,7 @@ async def parse_sdal_with_groq(text: str, apt_names: list[str]) -> dict | None:
     headers_g = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
     apts_str = ", ".join(apt_names) if apt_names else "нет апартаментов"
+    current_year = datetime.now().year
 
     prompt = f"""Разбери команду заезда в апартамент. Слова могут быть в любом порядке.
 
@@ -447,12 +448,14 @@ async def parse_sdal_with_groq(text: str, apt_names: list[str]) -> dict | None:
 
 Список апартаментов пользователя: {apts_str}
 
+Текущий год: {current_year}
+
 Правила:
 - apt_name: название апартамента из списка (первое слово номера должно совпадать)
 - checkin_type: "daily" если сутки/суточный, "hourly" если часовой/час/почасово
 - amount: сумма в тенге (число)
 - hours: количество часов для почасового (если не указано явно — 2), для суточного null
-- date: дата в формате YYYY-MM-DD если указана, иначе null
+- date: дата в формате YYYY-MM-DD если указана, иначе null. Если дата без года — ВСЕГДА используй {current_year}, никогда не используй прошлые годы
 
 Верни только JSON без пояснений:
 {{"apt_name": "название", "checkin_type": "daily/hourly", "amount": число, "hours": число_или_null, "date": "YYYY-MM-DD или null"}}
