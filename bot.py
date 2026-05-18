@@ -263,12 +263,15 @@ async def rename_apartment(user_id, old_name, new_name):
 
 # ─── ЗАЕЗДЫ ──────────────────────────────────────────────────────
 
-async def add_checkin(user_id, apt_id, amount, checkin_type, note="", checkin_date=None):
-    return await _post(f"{SUPABASE_URL}/rest/v1/checkins", {
+async def add_checkin(user_id, apt_id, amount, checkin_type, note="", checkin_date=None, checkout_date=None):
+    payload = {
         "user_id": user_id, "apartment_id": apt_id, "amount": amount,
         "type": checkin_type, "note": note,
         "check_in": checkin_date or now_kz().isoformat()
-    })
+    }
+    if checkout_date:
+        payload["check_out"] = checkout_date
+    return await _post(f"{SUPABASE_URL}/rest/v1/checkins", payload)
 
 async def close_previous_checkin(user_id, apt_id, new_check_in_dt: datetime):
     existing = await get_active_checkin(user_id, apt_id)
@@ -453,12 +456,13 @@ async def parse_sdal_with_groq(text: str, apt_names: list[str]) -> dict | None:
 Правила:
 - apt_name: название апартамента из списка (первое слово номера должно совпадать)
 - checkin_type: "daily" если сутки/суточный, "hourly" если часовой/час/почасово
-- amount: сумма в тенге (число)
+- amount: сумма в тенге за ОДНИ сутки/час (число)
 - hours: количество часов для почасового (если не указано явно — 2), для суточного null
+- days: количество суток если указано ("двое суток"=2, "трое суток"=3, "2 дня"=2, "неделя"=7 и т.д.), по умолчанию 1
 - date: дата в формате YYYY-MM-DD если указана, иначе null. Если дата без года — ВСЕГДА используй {current_year}, никогда не используй прошлые годы
 
 Верни только JSON без пояснений:
-{{"apt_name": "название", "checkin_type": "daily/hourly", "amount": число, "hours": число_или_null, "date": "YYYY-MM-DD или null"}}
+{{"apt_name": "название", "checkin_type": "daily/hourly", "amount": число, "hours": число_или_null, "days": число, "date": "YYYY-MM-DD или null"}}
 
 Если не можешь определить апартамент или сумму — верни {{"error": "причина"}}"""
 
@@ -516,6 +520,7 @@ async def parse_command_with_groq(text: str, apt_names: list[str]) -> dict:
 - checkin_type: "daily" (сутки/суточный/сутки) или "hourly" (часовой/час/почасово/почасовой), или null
 - amount: сумма числом без символов, или null
 - hours: часов для почасового (по умолчанию 2 если не указано явно), или null
+- days: количество суток если указано ("двое суток"=2, "трое суток"=3, "2 дня"=2, "неделя"=7 и т.д.), по умолчанию 1
 - date: дата YYYY-MM-DD (если год не указан — используй {current_year}), или null
 - guest_name: имя гостя, или null
 - phone: телефон гостя, или null
@@ -526,7 +531,7 @@ async def parse_command_with_groq(text: str, apt_names: list[str]) -> dict:
 - month: номер месяца 1-12 для отчёта (январь=1...декабрь=12), или null
 
 Верни ТОЛЬКО JSON без пояснений:
-{{"intent":"unknown","apt_name":null,"new_name":null,"checkin_type":null,"amount":null,"hours":null,"date":null,"guest_name":null,"phone":null,"check_in":null,"check_out":null,"category":null,"is_shared":false,"month":null}}"""
+{{"intent":"unknown","apt_name":null,"new_name":null,"checkin_type":null,"amount":null,"hours":null,"days":1,"date":null,"guest_name":null,"phone":null,"check_in":null,"check_out":null,"category":null,"is_shared":false,"month":null}}"""
 
     body = {
         "model": "llama-3.3-70b-versatile",
@@ -546,6 +551,53 @@ async def parse_command_with_groq(text: str, apt_names: list[str]) -> dict:
     except Exception as e:
         logger.error(f"Groq universal parse error: {e}")
         return {"intent": "unknown"}
+
+# ─── ХЕЛПЕР ЗАЕЗДА ───────────────────────────────────────────────
+
+async def execute_checkin(update, menu, user_id, apt, checkin_type, amount, hours, date_str, days):
+    """Записывает заезд (один или несколько суток подряд) и отвечает пользователю."""
+    note = f"{hours}ч" if checkin_type == "hourly" else ""
+    check_in_dt = (
+        datetime.fromisoformat(date_str + "T" + now_kz().strftime("%H:%M:%S"))
+        if date_str else now_kz()
+    )
+    date_text = f" ({date_str})" if date_str else ""
+
+    await close_previous_checkin(user_id, apt["id"], check_in_dt)
+
+    if days > 1 and checkin_type == "daily":
+        current_dt = check_in_dt
+        for i in range(days):
+            is_last = (i == days - 1)
+            checkout_dt = get_logical_checkout(current_dt)
+            await add_checkin(
+                user_id, apt["id"], amount, "daily",
+                checkin_date=current_dt.isoformat(),
+                checkout_date=None if is_last else checkout_dt.isoformat()
+            )
+            current_dt = checkout_dt + timedelta(minutes=1)
+
+        final_checkout = get_logical_checkout(current_dt - timedelta(minutes=1))
+        total = amount * days
+        await update.message.reply_text(
+            f"✅ Записано {days} суток{date_text}!\n\n"
+            f"🏠 {apt['name']}\n"
+            f"💰 {amount:,.0f} ₸ × {days} = {total:,.0f} ₸\n"
+            f"🕐 Выезд: {final_checkout.strftime('%d.%m')} в 12:00",
+            reply_markup=menu)
+    else:
+        await add_checkin(user_id, apt["id"], amount, checkin_type, note=note,
+                          checkin_date=check_in_dt.isoformat())
+        type_text = "почасово" if checkin_type == "hourly" else "суточный"
+        if checkin_type == "daily":
+            checkout_dt = get_logical_checkout(check_in_dt)
+            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%d.%m')} в 12:00"
+        else:
+            checkout_dt = get_hourly_checkout(check_in_dt, hours)
+            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%H:%M')} (через {hours}ч)"
+        await update.message.reply_text(
+            f"✅ Записан заезд{date_text}!\n\n🏠 {apt['name']}\n💰 {amount:,.0f} ₸ — {type_text}{checkout_info}",
+            reply_markup=menu)
 
 # ─── ОТМЕНА ──────────────────────────────────────────────────────
 
@@ -923,33 +975,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         checkin_type = parsed.get("checkin_type", "daily")
         amount = float(parsed.get("amount", 0))
         hours = int(parsed.get("hours") or 2)
+        days = int(parsed.get("days") or 1)
         date_str = parsed.get("date")
 
         if amount <= 0:
             await update.message.reply_text("Укажи сумму.\nПример: 'сдал 334 сутки 15000'", reply_markup=menu); return
 
-        # note всегда сохраняем с часами для почасовых
-        note = f"{hours}ч" if checkin_type == "hourly" else ""
-
-        check_in_dt = datetime.fromisoformat(date_str + "T" + now_kz().strftime("%H:%M:%S")) if date_str else now_kz()
-
-        await close_previous_checkin(user_id, apt["id"], check_in_dt)
-        await add_checkin(user_id, apt["id"], amount, checkin_type, note=note,
-                          checkin_date=check_in_dt.isoformat())
-
-        type_text = "почасово" if checkin_type == "hourly" else "суточный"
-        date_text = f" ({date_str})" if date_str else ""
-
-        if checkin_type == "daily":
-            checkout_dt = get_logical_checkout(check_in_dt)
-            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%d.%m')} в 12:00"
-        else:
-            checkout_dt = get_hourly_checkout(check_in_dt, hours)
-            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%H:%M')} (через {hours}ч)"
-
-        await update.message.reply_text(
-            f"✅ Записан заезд{date_text}!\n\n🏠 {apt['name']}\n💰 {amount:,.0f} ₸ — {type_text}{checkout_info}",
-            reply_markup=menu); return
+        await execute_checkin(update, menu, user_id, apt, checkin_type, amount, hours, date_str, days)
+        return
 
     if text_lower.startswith("выехал "):
         apt_name = text[7:].strip()
@@ -1145,24 +1178,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         checkin_type = parsed.get("checkin_type") or "daily"
         amount = float(parsed.get("amount") or 0)
         hours = int(parsed.get("hours") or 2)
+        days = int(parsed.get("days") or 1)
         date_str = parsed.get("date")
         if amount <= 0:
             await update.message.reply_text("Укажи сумму.\nПример: 'сдал 334 сутки 15000'", reply_markup=menu); return
-        note = f"{hours}ч" if checkin_type == "hourly" else ""
-        check_in_dt = datetime.fromisoformat(date_str + "T" + now_kz().strftime("%H:%M:%S")) if date_str else now_kz()
-        await close_previous_checkin(user_id, apt["id"], check_in_dt)
-        await add_checkin(user_id, apt["id"], amount, checkin_type, note=note, checkin_date=check_in_dt.isoformat())
-        type_text = "почасово" if checkin_type == "hourly" else "суточный"
-        date_text = f" ({date_str})" if date_str else ""
-        if checkin_type == "daily":
-            checkout_dt = get_logical_checkout(check_in_dt)
-            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%d.%m')} в 12:00"
-        else:
-            checkout_dt = get_hourly_checkout(check_in_dt, hours)
-            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%H:%M')} (через {hours}ч)"
-        await update.message.reply_text(
-            f"✅ Записан заезд{date_text}!\n\n🏠 {apt['name']}\n💰 {amount:,.0f} ₸ — {type_text}{checkout_info}",
-            reply_markup=menu)
+        await execute_checkin(update, menu, user_id, apt, checkin_type, amount, hours, date_str, days)
 
     elif intent == "checkout":
         if not apt:
