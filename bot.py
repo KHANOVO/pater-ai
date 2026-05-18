@@ -369,8 +369,11 @@ async def get_status(user_id):
 
 async def get_monthly_report(user_id, year=None, month=None):
     now = now_kz()
-    year = year or now.year
     month = month or now.month
+    if year is None:
+        year = now.year
+        if month > now.month:
+            year -= 1
     start = f"{year}-{month:02d}-01T00:00:00"
     end = f"{year+1}-01-01T00:00:00" if month == 12 else f"{year}-{month+1:02d}-01T00:00:00"
     checkins = await _get(f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}&check_in=gte.{start}&check_in=lt.{end}&select=amount,type,apartment_id&order=check_in")
@@ -566,7 +569,7 @@ async def execute_checkin(update, menu, user_id, apt, checkin_type, amount, hour
     await close_previous_checkin(user_id, apt["id"], check_in_dt)
 
     if days > 1 and checkin_type == "daily":
-        batch_id = f"batch:{int(now_kz().timestamp())}"
+        batch_id = f"batch_{int(now_kz().timestamp())}"
         current_dt = check_in_dt
         last_checkout_dt = None
         for i in range(days):
@@ -618,7 +621,7 @@ async def undo_last_action(user_id):
 
     async def delete_checkin(c):
         note = c.get("note") or ""
-        if note.startswith("batch:"):
+        if note.startswith("batch_"):
             apt_id = c["apartment_id"]
             batch = await _get(
                 f"{SUPABASE_URL}/rest/v1/checkins"
@@ -787,10 +790,10 @@ async def send_booking_reminders(app):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if str(query.from_user.id) != ADMIN_ID:
         await query.answer("Нет доступа.", show_alert=True)
         return
+    await query.answer()
     parts = query.data.split(":")
     if parts[0] == "grant":
         target_id, plan = parts[1], parts[2]
