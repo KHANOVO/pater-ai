@@ -566,24 +566,27 @@ async def execute_checkin(update, menu, user_id, apt, checkin_type, amount, hour
     await close_previous_checkin(user_id, apt["id"], check_in_dt)
 
     if days > 1 and checkin_type == "daily":
+        batch_id = f"batch:{int(now_kz().timestamp())}"
         current_dt = check_in_dt
+        last_checkout_dt = None
         for i in range(days):
             is_last = (i == days - 1)
             checkout_dt = get_logical_checkout(current_dt)
+            last_checkout_dt = checkout_dt
             await add_checkin(
                 user_id, apt["id"], amount, "daily",
+                note=batch_id,
                 checkin_date=current_dt.isoformat(),
                 checkout_date=None if is_last else checkout_dt.isoformat()
             )
             current_dt = checkout_dt + timedelta(minutes=1)
 
-        final_checkout = get_logical_checkout(current_dt - timedelta(minutes=1))
         total = amount * days
         await update.message.reply_text(
             f"✅ Записано {days} суток{date_text}!\n\n"
             f"🏠 {apt['name']}\n"
             f"💰 {amount:,.0f} ₸ × {days} = {total:,.0f} ₸\n"
-            f"🕐 Выезд: {final_checkout.strftime('%d.%m')} в 12:00",
+            f"🕐 Выезд: {last_checkout_dt.strftime('%d.%m')} в 12:00",
             reply_markup=menu)
     else:
         await add_checkin(user_id, apt["id"], amount, checkin_type, note=note,
@@ -604,7 +607,7 @@ async def execute_checkin(update, menu, user_id, apt, checkin_type, amount, hour
 async def undo_last_action(user_id):
     last_checkin = await _get(
         f"{SUPABASE_URL}/rest/v1/checkins?user_id=eq.{user_id}"
-        f"&order=created_at.desc&limit=1&select=id,created_at,apartment_id"
+        f"&order=created_at.desc&limit=1&select=id,created_at,apartment_id,note"
     )
     last_expense = await _get(
         f"{SUPABASE_URL}/rest/v1/expenses?user_id=eq.{user_id}"
@@ -613,17 +616,32 @@ async def undo_last_action(user_id):
     checkin_time = last_checkin[0]["created_at"] if last_checkin else None
     expense_time = last_expense[0]["created_at"] if last_expense else None
 
+    async def delete_checkin(c):
+        note = c.get("note") or ""
+        if note.startswith("batch:"):
+            apt_id = c["apartment_id"]
+            batch = await _get(
+                f"{SUPABASE_URL}/rest/v1/checkins"
+                f"?user_id=eq.{user_id}&apartment_id=eq.{apt_id}&note=eq.{note}&select=id"
+            )
+            for row in batch:
+                await _delete(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{row['id']}")
+            return f"{len(batch)} суток"
+        else:
+            await _delete(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{c['id']}")
+            return None
+
     if checkin_time and expense_time:
         if checkin_time >= expense_time:
-            await _delete(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{last_checkin[0]['id']}")
-            return "заезд", None
+            detail = await delete_checkin(last_checkin[0])
+            return "заезд", detail
         else:
             e = last_expense[0]
             await _delete(f"{SUPABASE_URL}/rest/v1/expenses?id=eq.{e['id']}")
             return "расход", f"{e['category']} {float(e['amount']):,.0f} ₸"
     elif checkin_time:
-        await _delete(f"{SUPABASE_URL}/rest/v1/checkins?id=eq.{last_checkin[0]['id']}")
-        return "заезд", None
+        detail = await delete_checkin(last_checkin[0])
+        return "заезд", detail
     elif expense_time:
         e = last_expense[0]
         await _delete(f"{SUPABASE_URL}/rest/v1/expenses?id=eq.{e['id']}")
@@ -1098,7 +1116,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text_lower in ["отмена", "отменить"]:
         action_type, detail = await undo_last_action(user_id)
         if action_type == "заезд":
-            await update.message.reply_text("↩️ Последний заезд удалён.", reply_markup=menu)
+            suffix = f": {detail}" if detail else ""
+            await update.message.reply_text(f"↩️ Последний заезд удалён{suffix}.", reply_markup=menu)
         elif action_type == "расход":
             await update.message.reply_text(f"↩️ Последний расход удалён: {detail}", reply_markup=menu)
         else:
