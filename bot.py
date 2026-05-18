@@ -481,6 +481,72 @@ async def parse_sdal_with_groq(text: str, apt_names: list[str]) -> dict | None:
         logger.error(f"Groq parse error: {e}")
         return None
 
+# ─── GROQ УНИВЕРСАЛЬНЫЙ ПАРСЕР ────────────────────────────────────
+
+async def parse_command_with_groq(text: str, apt_names: list[str]) -> dict:
+    """Определяет намерение и извлекает параметры из любого сообщения."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers_g = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    apts_str = ", ".join(apt_names) if apt_names else "нет апартаментов"
+    current_year = now_kz().year
+    today = now_kz().strftime("%d.%m.%Y")
+
+    prompt = f"""Ты помощник для управления апартаментами. Определи намерение пользователя и извлеки параметры.
+
+Сообщение: "{text}"
+Список апартаментов пользователя: {apts_str}
+Текущий год: {current_year}, сегодня: {today}
+
+Намерения:
+- "checkin" — гость заехал/сдал/заселился (нужны: апартамент, тип суточный/часовой, сумма)
+- "checkout" — гость выехал/уехал/освободил апартамент
+- "add_apartment" — добавить/создать НОВЫЙ апартамент (название НЕ из существующего списка)
+- "delete_apartment" — удалить апартамент из списка
+- "rename_apartment" — переименовать апартамент
+- "booking" — создать бронь (гость приедет в будущем)
+- "cancel_booking" — отменить/снять бронь
+- "expense" — записать расход/трату
+- "report_apt" — отчёт по конкретному апартаменту
+- "report_month" — отчёт за месяц (месячный доход/расход)
+- "unknown" — не понятно
+
+Правила для полей:
+- apt_name: название из списка [{apts_str}] (первое слово должно совпадать), или null
+- new_name: для add_apartment — название нового апартамента (придумывает пользователь); для rename_apartment — новое название; иначе null
+- checkin_type: "daily" (сутки/суточный/сутки) или "hourly" (часовой/час/почасово/почасовой), или null
+- amount: сумма числом без символов, или null
+- hours: часов для почасового (по умолчанию 2 если не указано явно), или null
+- date: дата YYYY-MM-DD (если год не указан — используй {current_year}), или null
+- guest_name: имя гостя, или null
+- phone: телефон гостя, или null
+- check_in: дата заезда брони YYYY-MM-DD, или null
+- check_out: дата выезда брони YYYY-MM-DD, или null
+- category: категория расхода (горничная/уборка/ремонт/и т.д.), или null
+- is_shared: true если расход общий для всех апартаментов (слово "общий"), false если для конкретного
+- month: номер месяца 1-12 для отчёта (январь=1...декабрь=12), или null
+
+Верни ТОЛЬКО JSON без пояснений:
+{{"intent":"unknown","apt_name":null,"new_name":null,"checkin_type":null,"amount":null,"hours":null,"date":null,"guest_name":null,"phone":null,"check_in":null,"check_out":null,"category":null,"is_shared":false,"month":null}}"""
+
+    body = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(url, headers=headers_g, json=body)
+            content = r.json()["choices"][0]["message"]["content"].strip()
+        if "```" in content:
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        return json.loads(content.strip())
+    except Exception as e:
+        logger.error(f"Groq universal parse error: {e}")
+        return {"intent": "unknown"}
+
 # ─── ОТМЕНА ──────────────────────────────────────────────────────
 
 async def undo_last_action(user_id):
@@ -1061,7 +1127,134 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Не удалось уведомить {tid}: {e}")
             return
 
-    await update.message.reply_text("Не понял. Нажми 🤖 Команды чтобы увидеть все доступные команды.", reply_markup=menu)
+    # ─── GROQ FALLBACK — универсальный парсер для нераспознанных команд ───
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    apts = await get_apartments(user_id)
+    apt_names = [a["name"] for a in apts]
+    parsed = await parse_command_with_groq(text, apt_names)
+    intent = parsed.get("intent", "unknown")
+
+    apt_name = (parsed.get("apt_name") or "").strip()
+    apt = await find_apartment(user_id, apt_name) if apt_name else None
+
+    if intent == "checkin":
+        if not apt:
+            await update.message.reply_text(
+                f"Апартамент '{apt_name}' не найден.\n\nНажми 🏠 Апартаменты чтобы увидеть список.",
+                reply_markup=menu); return
+        checkin_type = parsed.get("checkin_type") or "daily"
+        amount = float(parsed.get("amount") or 0)
+        hours = int(parsed.get("hours") or 2)
+        date_str = parsed.get("date")
+        if amount <= 0:
+            await update.message.reply_text("Укажи сумму.\nПример: 'сдал 334 сутки 15000'", reply_markup=menu); return
+        note = f"{hours}ч" if checkin_type == "hourly" else ""
+        check_in_dt = datetime.fromisoformat(date_str + "T" + now_kz().strftime("%H:%M:%S")) if date_str else now_kz()
+        await close_previous_checkin(user_id, apt["id"], check_in_dt)
+        await add_checkin(user_id, apt["id"], amount, checkin_type, note=note, checkin_date=check_in_dt.isoformat())
+        type_text = "почасово" if checkin_type == "hourly" else "суточный"
+        date_text = f" ({date_str})" if date_str else ""
+        if checkin_type == "daily":
+            checkout_dt = get_logical_checkout(check_in_dt)
+            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%d.%m')} в 12:00"
+        else:
+            checkout_dt = get_hourly_checkout(check_in_dt, hours)
+            checkout_info = f"\n🕐 Выезд: {checkout_dt.strftime('%H:%M')} (через {hours}ч)"
+        await update.message.reply_text(
+            f"✅ Записан заезд{date_text}!\n\n🏠 {apt['name']}\n💰 {amount:,.0f} ₸ — {type_text}{checkout_info}",
+            reply_markup=menu)
+
+    elif intent == "checkout":
+        if not apt:
+            await update.message.reply_text(f"Апартамент '{apt_name}' не найден.", reply_markup=menu); return
+        active = await get_active_checkin(user_id, apt["id"])
+        if not active:
+            await update.message.reply_text(f"🟢 {apt['name']} уже свободен.", reply_markup=menu); return
+        await checkout_apartment(user_id, apt["id"])
+        await update.message.reply_text(f"✅ Гость выехал!\n\n🏠 {apt['name']} — теперь свободен 🟢", reply_markup=menu)
+
+    elif intent == "add_apartment":
+        new_apt_name = (parsed.get("new_name") or "").strip()
+        if not new_apt_name:
+            await update.message.reply_text("Напиши название: 'добавить 334'", reply_markup=menu); return
+        result = await add_apartment(user_id, new_apt_name)
+        msg = f"✅ Апартамент '{new_apt_name}' добавлен!" if result else "Ошибка. Попробуй снова."
+        await update.message.reply_text(msg, reply_markup=menu)
+
+    elif intent == "delete_apartment":
+        if not apt:
+            await update.message.reply_text(f"Апартамент '{apt_name}' не найден.", reply_markup=menu); return
+        success = await delete_apartment(user_id, apt["name"])
+        msg = "✅ Апартамент удалён." if success else f"Апартамент '{apt_name}' не найден."
+        await update.message.reply_text(msg, reply_markup=menu)
+
+    elif intent == "rename_apartment":
+        new_name = (parsed.get("new_name") or "").strip()
+        if not apt or not new_name:
+            await update.message.reply_text("Укажи: 'переименовать 334 в Люкс'", reply_markup=menu); return
+        success = await rename_apartment(user_id, apt["name"], new_name)
+        msg = f"✅ Переименовано в '{new_name}'" if success else f"Апартамент '{apt_name}' не найден."
+        await update.message.reply_text(msg, reply_markup=menu)
+
+    elif intent == "booking":
+        if not apt:
+            await update.message.reply_text(f"Апартамент '{apt_name}' не найден.", reply_markup=menu); return
+        guest_name = parsed.get("guest_name") or "Гость"
+        phone = parsed.get("phone") or ""
+        check_in_date = parsed.get("check_in") or now_kz().date().isoformat()
+        check_out_date = parsed.get("check_out") or (now_kz().date() + timedelta(days=1)).isoformat()
+        await add_booking(user_id, apt["id"], guest_name, phone, check_in_date, check_out_date)
+        await update.message.reply_text(
+            f"📅 Бронь записана!\n\n🏠 {apt['name']}\n👤 {guest_name}\n📞 {phone}\n📆 {check_in_date} → {check_out_date}",
+            reply_markup=menu)
+
+    elif intent == "cancel_booking":
+        if not apt:
+            await update.message.reply_text(f"Апартамент '{apt_name}' не найден.", reply_markup=menu); return
+        cancel_date = parsed.get("date")
+        if cancel_date:
+            bookings_list = await _get(
+                f"{SUPABASE_URL}/rest/v1/bookings?user_id=eq.{user_id}&apartment_id=eq.{apt['id']}&check_in=eq.{cancel_date}&status=eq.confirmed&select=id")
+        else:
+            bookings_list = await _get(
+                f"{SUPABASE_URL}/rest/v1/bookings?user_id=eq.{user_id}&apartment_id=eq.{apt['id']}&status=eq.confirmed&select=id&order=check_in.desc&limit=1")
+        if not bookings_list:
+            await update.message.reply_text("Бронь не найдена.", reply_markup=menu); return
+        await _patch(f"{SUPABASE_URL}/rest/v1/bookings?id=eq.{bookings_list[0]['id']}", {"status": "cancelled"})
+        date_text = f" на {cancel_date}" if cancel_date else ""
+        await update.message.reply_text(f"✅ Бронь{date_text} для {apt['name']} отменена.", reply_markup=menu)
+
+    elif intent == "expense":
+        amount = float(parsed.get("amount") or 0)
+        if amount <= 0:
+            await update.message.reply_text(
+                "Укажи сумму.\nПример: 'горничная 5000 общий' или '334 ремонт 15000'",
+                reply_markup=menu); return
+        category = (parsed.get("category") or "прочее").strip()
+        is_shared = bool(parsed.get("is_shared", False))
+        expense_date = parsed.get("date")
+        await add_expense(user_id, amount, category, text,
+            apt_id=apt["id"] if apt else None, is_shared=is_shared, expense_date=expense_date)
+        apt_text = f"\n🏠 {apt['name']}" if apt else "\n📦 Общий расход"
+        date_text = f"\n📅 Дата: {expense_date[:10]}" if expense_date else ""
+        await update.message.reply_text(
+            f"❌ Расход записан!{apt_text}\n💰 {amount:,.0f} ₸ — {category}{date_text}",
+            reply_markup=menu)
+
+    elif intent == "report_apt":
+        if not apt:
+            await update.message.reply_text(f"Апартамент '{apt_name}' не найден.", reply_markup=menu); return
+        await update.message.reply_text(await get_apt_report(user_id, apt), reply_markup=menu)
+
+    elif intent == "report_month":
+        month = parsed.get("month")
+        await update.message.reply_text(
+            await get_monthly_report(user_id, month=int(month) if month else None),
+            reply_markup=menu)
+
+    else:
+        await update.message.reply_text(
+            "Не понял. Нажми 🤖 Команды чтобы увидеть все доступные команды.", reply_markup=menu)
 
 # ─── ЗАПУСК ───────────────────────────────────────────────────────
 
